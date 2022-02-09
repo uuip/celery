@@ -310,6 +310,7 @@ class Celery:
 
         self.on_init()
         _register_app(self)
+        self.redis_backend = None
 
     def _get_default_loader(self):
         # the --loader command-line argument sets the environment variable.
@@ -934,6 +935,11 @@ class Celery:
         backend, url = backends.by_url(
             self.backend_cls or self.conf.result_backend,
             self.loader)
+        # redis-py always use independent connection for every command, one pool instance is enough
+        if url.startswith('redis'):
+            if not self.redis_backend:
+                self.redis_backend = backend(app=self, url=url)
+            return self.redis_backend
         return backend(app=self, url=url)
 
     def _finalize_pending_conf(self):
