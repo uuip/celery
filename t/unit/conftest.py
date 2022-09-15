@@ -30,12 +30,6 @@ __all__ = (
     'celery_parameters'
 )
 
-try:
-    WindowsError = WindowsError
-except NameError:
-
-    class WindowsError(Exception):
-        pass
 
 PYPY3 = getattr(sys, 'pypy_version_info', None) and sys.version_info[0] > 3
 
@@ -360,7 +354,7 @@ def sleepdeprived(request):
         >>>     pass
     """
     module = request.node.get_closest_marker(
-            "sleepdeprived_patched_module").args[0]
+        "sleepdeprived_patched_module").args[0]
     old_sleep, module.sleep = module.sleep, noop
     try:
         yield

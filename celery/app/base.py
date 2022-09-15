@@ -253,7 +253,7 @@ class Celery:
         self._pending_periodic_tasks = deque()
 
         self.finalized = False
-        self._finalize_mutex = threading.Lock()
+        self._finalize_mutex = threading.RLock()
         self._pending = deque()
         self._tasks = tasks
         if not isinstance(self._tasks, TaskRegistry):
@@ -734,7 +734,8 @@ class Celery:
             options, route_name or name, args, kwargs, task_type)
         if expires is not None:
             if isinstance(expires, datetime):
-                expires_s = (maybe_make_aware(expires) - self.now()).total_seconds()
+                expires_s = (maybe_make_aware(
+                    expires) - self.now()).total_seconds()
             else:
                 expires_s = expires
 
@@ -766,6 +767,7 @@ class Celery:
                     options.setdefault('priority',
                                        parent.request.delivery_info.get('priority'))
 
+        # alias for 'task_as_v2'
         message = amqp.create_task_message(
             task_id, name, args, kwargs, countdown, eta, group_id, group_index,
             expires, retries, chord,
@@ -774,8 +776,7 @@ class Celery:
             self.conf.task_send_sent_event,
             root_id, parent_id, shadow, chain,
             ignore_result=ignore_result,
-            argsrepr=options.get('argsrepr'),
-            kwargsrepr=options.get('kwargsrepr'),
+            **options
         )
 
         if connection:

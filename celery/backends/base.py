@@ -230,7 +230,7 @@ class Backend:
                         hasattr(errback.type, '__header__') and
 
                         # workaround to support tasks with bind=True executed as
-                        # link errors. Otherwise retries can't be used
+                        # link errors. Otherwise, retries can't be used
                         not isinstance(errback.type.__header__, partial) and
                         arity_greater(errback.type.__header__, 1)
                 ):
@@ -488,8 +488,11 @@ class Backend:
                     'retries': getattr(request, 'retries', None),
                     'queue': request.delivery_info.get('routing_key')
                     if hasattr(request, 'delivery_info') and
-                    request.delivery_info else None
+                    request.delivery_info else None,
                 }
+                if getattr(request, 'stamps'):
+                    request_meta['stamped_headers'] = request.stamped_headers
+                    request_meta.update(request.stamps)
 
                 if encode:
                     # args and kwargs need to be encoded properly before saving
@@ -569,9 +572,10 @@ class Backend:
             pass
 
     def _ensure_not_eager(self):
-        if self.app.conf.task_always_eager:
+        if self.app.conf.task_always_eager and not self.app.conf.task_store_eager_result:
             warnings.warn(
-                "Shouldn't retrieve result with task_always_eager enabled.",
+                "Results are not stored in backend and should not be retrieved when "
+                "task_always_eager is enabled, unless task_store_eager_result is enabled.",
                 RuntimeWarning
             )
 
@@ -846,23 +850,27 @@ class BaseKeyValueStoreBackend(Backend):
 
     def get_key_for_task(self, task_id, key=''):
         """Get the cache key for a task by id."""
-        key_t = self.key_t
-        return key_t('').join([
-            self.task_keyprefix, key_t(task_id), key_t(key),
-        ])
+        if not task_id:
+            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+        return self._get_key_for(self.task_keyprefix, task_id, key)
 
     def get_key_for_group(self, group_id, key=''):
         """Get the cache key for a group by id."""
-        key_t = self.key_t
-        return key_t('').join([
-            self.group_keyprefix, key_t(group_id), key_t(key),
-        ])
+        if not group_id:
+            raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
+        return self._get_key_for(self.group_keyprefix, group_id, key)
 
     def get_key_for_chord(self, group_id, key=''):
         """Get the cache key for the chord waiting on group with given id."""
+        if not group_id:
+            raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
+        return self._get_key_for(self.chord_keyprefix, group_id, key)
+
+    def _get_key_for(self, prefix, id, key=''):
         key_t = self.key_t
+
         return key_t('').join([
-            self.chord_keyprefix, key_t(group_id), key_t(key),
+            prefix, key_t(id), key_t(key),
         ])
 
     def _strip_prefix(self, key):

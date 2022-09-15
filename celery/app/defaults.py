@@ -10,7 +10,7 @@ __all__ = ('Option', 'NAMESPACES', 'flatten', 'find')
 
 DEFAULT_POOL = 'prefork'
 
-DEFAULT_ACCEPT_CONTENT = ['json']
+DEFAULT_ACCEPT_CONTENT = ('json',)
 DEFAULT_PROCESS_LOG_FMT = """
     [%(asctime)s: %(levelname)s/%(processName)s] %(message)s
 """.strip()
@@ -114,6 +114,7 @@ NAMESPACES = Namespace(
         port=Option(type='string'),
         read_consistency=Option(type='string'),
         servers=Option(type='list'),
+        bundle_path=Option(type='string'),
         table=Option(type='string'),
         write_consistency=Option(type='string'),
         auth_provider=Option(type='string'),
@@ -290,6 +291,7 @@ NAMESPACES = Namespace(
         ),
         store_errors_even_if_ignored=Option(False, type='bool'),
         track_started=Option(False, type='bool'),
+        allow_error_cb_on_chord_header=Option(False, type='bool'),
     ),
     worker=Namespace(
         __old__=OLD_NS_WORKER,

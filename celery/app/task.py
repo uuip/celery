@@ -8,7 +8,7 @@ from kombu.utils.uuid import uuid
 
 from celery import current_app, states
 from celery._state import _task_stack
-from celery.canvas import _chain, group, signature
+from celery.canvas import GroupStampingVisitor, _chain, group, signature
 from celery.exceptions import Ignore, ImproperlyConfigured, MaxRetriesExceededError, Reject, Retry
 from celery.local import class_property
 from celery.result import EagerResult, denied_join_result
@@ -93,9 +93,23 @@ class Context:
     taskset = None   # compat alias to group
     timelimit = None
     utc = None
+    stamped_headers = None
+    stamps = None
 
     def __init__(self, *args, **kwargs):
         self.update(*args, **kwargs)
+        if self.headers is None:
+            self.headers = self._get_custom_headers(*args, **kwargs)
+
+    def _get_custom_headers(self, *args, **kwargs):
+        headers = {}
+        headers.update(*args, **kwargs)
+        celery_keys = {*Context.__dict__.keys(), 'lang', 'task', 'argsrepr', 'kwargsrepr'}
+        for key in celery_keys:
+            headers.pop(key, None)
+        if not headers:
+            return None
+        return headers
 
     def update(self, *args, **kwargs):
         return self.__dict__.update(*args, **kwargs)
@@ -604,7 +618,7 @@ class Task:
         request = self.request if request is None else request
         args = request.args if args is None else args
         kwargs = request.kwargs if kwargs is None else kwargs
-        options = request.as_execution_options()
+        options = {**request.as_execution_options(), **extra_options}
         delivery_info = request.delivery_info or {}
         priority = delivery_info.get('priority')
         if priority is not None:
@@ -639,7 +653,7 @@ class Task:
             ...         twitter.post_status_update(message)
             ...     except twitter.FailWhale as exc:
             ...         # Retry in 5 minutes.
-            ...         self.retry(countdown=60 * 5, exc=exc)
+            ...         raise self.retry(countdown=60 * 5, exc=exc)
 
         Note:
             Although the task will never return above as `retry` raises an
@@ -782,8 +796,14 @@ class Task:
                 'exchange': options.get('exchange'),
                 'routing_key': options.get('routing_key'),
                 'priority': options.get('priority'),
-            },
+            }
         }
+        if 'stamped_headers' in options:
+            request['stamped_headers'] = maybe_list(options['stamped_headers'])
+            request['stamps'] = {
+                header: maybe_list(options.get(header, [])) for header in request['stamped_headers']
+            }
+
         tb = None
         tracer = build_tracer(
             task.name, task, eager=True,
@@ -930,6 +950,12 @@ class Task:
         # retain their original task IDs as well
         for t in reversed(self.request.chain or []):
             sig |= signature(t, app=self.app)
+        # Stamping sig with parents groups
+        stamped_headers = self.request.stamped_headers
+        if self.request.stamps:
+            groups = self.request.stamps.get("groups")
+            sig.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+
         # Finally, either apply or delay the new signature!
         if self.request.is_eager:
             return sig.apply().get()

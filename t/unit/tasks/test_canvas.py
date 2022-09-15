@@ -1,4 +1,5 @@
 import json
+import math
 from unittest.mock import ANY, MagicMock, Mock, call, patch, sentinel
 
 import pytest
@@ -16,6 +17,10 @@ SIG = Signature({
     'options': {'task_id': 'TASK_ID'},
     'subtask_type': ''},
 )
+try:
+    from collections import Iterable
+except ImportError:
+    from collections.abc import Iterable
 
 
 class test_maybe_unroll_group:
@@ -36,20 +41,154 @@ class CanvasCase:
         @self.app.task(shared=False)
         def add(x, y):
             return x + y
+
         self.add = add
 
         @self.app.task(shared=False)
         def mul(x, y):
             return x * y
+
         self.mul = mul
 
         @self.app.task(shared=False)
         def div(x, y):
             return x / y
+
         self.div = div
+
+        @self.app.task(shared=False)
+        def xsum(numbers):
+            return sum(sum(num) if isinstance(num, Iterable) else num for num in numbers)
+
+        self.xsum = xsum
+
+        @self.app.task(shared=False, bind=True)
+        def replaced(self, x, y):
+            return self.replace(add.si(x, y))
+
+        self.replaced = replaced
+
+        @self.app.task(shared=False, bind=True)
+        def replaced_group(self, x, y):
+            return self.replace(group(add.si(x, y), mul.si(x, y)))
+
+        self.replaced_group = replaced_group
+
+        @self.app.task(shared=False, bind=True)
+        def replace_with_group(self, x, y):
+            return self.replace(group(add.si(x, y), mul.si(x, y)))
+
+        self.replace_with_group = replace_with_group
+
+        @self.app.task(shared=False, bind=True)
+        def replace_with_chain(self, x, y):
+            return self.replace(group(add.si(x, y) | mul.s(y), add.si(x, y)))
+
+        self.replace_with_chain = replace_with_chain
+
+        @self.app.task(shared=False)
+        def xprod(numbers):
+            try:
+                return math.prod(numbers)
+            except AttributeError:
+                #  TODO: Drop this backport once
+                #        we drop support for Python 3.7
+                import operator
+                from functools import reduce
+
+                return reduce(operator.mul, numbers)
+
+        self.xprod = xprod
+
+
+@Signature.register_type()
+class chord_subclass(chord):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subtask_type = "chord_subclass"
+
+
+@Signature.register_type()
+class group_subclass(group):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subtask_type = "group_subclass"
+
+
+@Signature.register_type()
+class chain_subclass(chain):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subtask_type = "chain_subclass"
+
+
+@Signature.register_type()
+class chunks_subclass(chunks):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.subtask_type = "chunks_subclass"
 
 
 class test_Signature(CanvasCase):
+    def test_double_stamping(self, subtests):
+        """
+        Test manual signature stamping with two different stamps.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_1.stamp(stamp1="stamp1")
+        sig_1.stamp(stamp2="stamp2")
+        sig_1_res = sig_1.freeze()
+        sig_1.apply()
+
+        with subtests.test("sig_1_res is stamped with stamp1", stamp1=["stamp1"]):
+            assert sig_1_res._get_task_meta()["stamp1"] == ["stamp1"]
+
+        with subtests.test("sig_1_res is stamped with stamp2", stamp2=["stamp2"]):
+            assert sig_1_res._get_task_meta()["stamp2"] == ["stamp2"]
+
+        with subtests.test("sig_1_res is stamped twice", stamped_headers=["stamp2", "stamp1"]):
+            assert sig_1_res._get_task_meta()["stamped_headers"] == ["stamp2", "stamp1", "groups"]
+
+    def test_twice_stamping(self, subtests):
+        """
+        Test manual signature stamping with two stamps twice.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_1.stamp(stamp="stamp1")
+        sig_1.stamp(stamp="stamp2")
+        sig_1_res = sig_1.freeze()
+        sig_1.apply()
+
+        with subtests.test("sig_1_res is stamped twice", stamps=["stamp2", "stamp1"]):
+            assert sig_1_res._get_task_meta()["stamp"] == ["stamp2", "stamp1"]
+
+        with subtests.test("sig_1_res is stamped twice", stamped_headers=["stamp2", "stamp1"]):
+            assert sig_1_res._get_task_meta()["stamped_headers"] == ["stamp", "groups"]
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_manual_stamping(self):
+        """
+        Test manual signature stamping.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        stamps = ["stamp1", "stamp2"]
+        sig_1.stamp(visitor=None, groups=[stamps[1]])
+        sig_1.stamp(visitor=None, groups=stamps[0])
+        sig_1_res = sig_1.freeze()
+        sig_1.apply()
+        assert sig_1_res._get_task_meta()['groups'] == stamps
 
     def test_getitem_property_class(self):
         assert Signature.task
@@ -268,6 +407,13 @@ class test_xmap_xstarmap(CanvasCase):
 
 class test_chunks(CanvasCase):
 
+    def test_chunks_preserves_state(self):
+        x = self.add.chunks(range(100), 10)
+        d = dict(x)
+        d['subtask_type'] = "chunks_subclass"
+        isinstance(chunks_subclass.from_dict(d), chunks_subclass)
+        isinstance(chunks_subclass.from_dict(d).clone(), chunks_subclass)
+
     def test_chunks(self):
         x = self.add.chunks(range(100), 10)
         assert dict(chunks.from_dict(dict(x), app=self.app)) == dict(x)
@@ -294,11 +440,13 @@ class test_chain(CanvasCase):
         s = self.add.s(1, 1)
         assert chain([chain(s)]).tasks == list(chain(s).tasks)
 
-    def test_clone_preserves_state(self):
-        x = chain(self.add.s(i, i) for i in range(10))
+    @pytest.mark.parametrize("chain_type", (_chain, chain_subclass))
+    def test_clone_preserves_state(self, chain_type):
+        x = chain_type(self.add.s(i, i) for i in range(10))
         assert x.clone().tasks == x.tasks
         assert x.clone().kwargs == x.kwargs
         assert x.clone().args == x.args
+        assert isinstance(x.clone(), chain_type)
 
     def test_repr(self):
         x = self.add.s(2, 2) | self.add.s(2)
@@ -311,24 +459,30 @@ class test_chain(CanvasCase):
         assert result.parent.parent
         assert result.parent.parent.parent is None
 
-    def test_splices_chains(self):
-        c = chain(
+    @pytest.mark.parametrize("chain_type", (_chain, chain_subclass))
+    def test_splices_chains(self, chain_type):
+        c = chain_type(
             self.add.s(5, 5),
-            chain(self.add.s(6), self.add.s(7), self.add.s(8), app=self.app),
+            chain_type(self.add.s(6), self.add.s(7), self.add.s(8), app=self.app),
             app=self.app,
         )
         c.freeze()
         tasks, _ = c._frozen
         assert len(tasks) == 4
+        assert isinstance(c, chain_type)
 
-    def test_from_dict_no_tasks(self):
-        assert chain.from_dict(dict(chain(app=self.app)), app=self.app)
+    @pytest.mark.parametrize("chain_type", [_chain, chain_subclass])
+    def test_from_dict_no_tasks(self, chain_type):
+        assert chain_type.from_dict(dict(chain_type(app=self.app)), app=self.app)
+        assert isinstance(chain_type.from_dict(dict(chain_type(app=self.app)), app=self.app), chain_type)
 
-    def test_from_dict_full_subtasks(self):
-        c = chain(self.add.si(1, 2), self.add.si(3, 4), self.add.si(5, 6))
+    @pytest.mark.parametrize("chain_type", [_chain, chain_subclass])
+    def test_from_dict_full_subtasks(self, chain_type):
+        c = chain_type(self.add.si(1, 2), self.add.si(3, 4), self.add.si(5, 6))
         serialized = json.loads(json.dumps(c))
-        deserialized = chain.from_dict(serialized)
+        deserialized = chain_type.from_dict(serialized)
         assert all(isinstance(task, Signature) for task in deserialized.tasks)
+        assert isinstance(deserialized, chain_type)
 
     @pytest.mark.usefixtures('depends_on_current_app')
     def test_app_falls_back_to_default(self):
@@ -618,6 +772,326 @@ class test_chain(CanvasCase):
 
 
 class test_group(CanvasCase):
+    def test_group_stamping_one_level(self, subtests):
+        """
+        Test that when a group ID is frozen, that group ID is stored in
+        each task within the group.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(4, 4)
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+
+        g = group(sig_1, sig_2, app=self.app)
+        g.stamp(stamp="stamp")
+        g_res = g.freeze()
+        g.apply()
+
+        with subtests.test("sig_1_res is stamped", groups=[g_res.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g_res.id]
+
+        with subtests.test("sig_1_res is stamped manually", stamp=["stamp"]):
+            assert sig_1_res._get_task_meta()['stamp'] == ["stamp"]
+
+        with subtests.test("sig_2_res is stamped", groups=[g_res.id]):
+            assert sig_2_res._get_task_meta()['groups'] == [g_res.id]
+
+        with subtests.test("sig_2_res is stamped manually", stamp=["stamp"]):
+            assert sig_2_res._get_task_meta()['stamp'] == ["stamp"]
+
+        with subtests.test("sig_1_res has stamped_headers", stamped_headers=["stamp", 'groups']):
+            assert sig_1_res._get_task_meta()['stamped_headers'] == ['stamp', 'groups']
+
+        with subtests.test("sig_2_res has stamped_headers", stamped_headers=["stamp"]):
+            assert sig_2_res._get_task_meta()['stamped_headers'] == ['stamp', 'groups']
+
+    def test_group_stamping_two_levels(self, subtests):
+        """
+        For a group within a group, test that group stamps are stored in
+        the correct order.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(1, 1)
+        nested_sig_1 = self.add.s(2)
+        nested_sig_2 = self.add.s(4)
+
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+        first_nested_sig_res = nested_sig_1.freeze()
+        second_nested_sig_res = nested_sig_2.freeze()
+
+        g2 = group(
+            nested_sig_1,
+            nested_sig_2,
+            app=self.app
+        )
+
+        g2_res = g2.freeze()
+
+        g1 = group(
+            sig_1,
+            chain(
+                sig_2,
+                g2,
+                app=self.app
+            ),
+            app=self.app
+        )
+
+        g1_res = g1.freeze()
+        g1.apply()
+
+        with subtests.test("sig_1_res is stamped", groups=[g1_res.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g1_res.id]
+        with subtests.test("sig_2_res is stamped", groups=[g1_res.id]):
+            assert sig_2_res._get_task_meta()['groups'] == [g1_res.id]
+        with subtests.test("first_nested_sig_res is stamped", groups=[g1_res.id, g2_res.id]):
+            assert first_nested_sig_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+        with subtests.test("second_nested_sig_res is stamped", groups=[g1_res.id, g2_res.id]):
+            assert second_nested_sig_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+
+    def test_group_stamping_with_replace(self, subtests):
+        """
+        For a group within a replaced element, test that group stamps are replaced correctly.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(2, 2) | self.replaced.s(8)
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+
+        g = group(sig_1, sig_2, app=self.app)
+        g_res = g.freeze()
+        g.apply()
+
+        with subtests.test("sig_1_res is stamped", groups=[g_res.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g_res.id]
+        with subtests.test("sig_2_res is stamped", groups=[g_res.id]):
+            assert sig_2_res._get_task_meta()['groups'] == [g_res.id]
+
+    def test_group_stamping_with_replaced_group(self, subtests):
+        """
+        For a group within a replaced element, test that group stamps are replaced correctly.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+        nested_g = self.replace_with_group.s(8)
+        nested_g_res = nested_g.freeze()
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(2, 2) | nested_g
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+
+        g = group(sig_1, sig_2, app=self.app)
+        g_res = g.freeze()
+        g.apply()
+
+        with subtests.test("sig_1_res is stamped", groups=[g_res.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g_res.id]
+        with subtests.test("sig_2_res is stamped", groups=nested_g_res._get_task_meta()['groups']):
+            assert sig_2_res._get_task_meta()['groups'] == nested_g_res._get_task_meta()['groups']
+
+    def test_group_stamping_with_replaced_chain(self, subtests):
+        """
+        For a group within a replaced element, test that group stamps are replaced correctly.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+        nested_g = self.replace_with_chain.s(8)
+        nested_g_res = nested_g.freeze()
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(2, 2) | nested_g
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+
+        g = group(sig_1, sig_2, app=self.app)
+        g_res = g.freeze()
+        g.apply()
+
+        with subtests.test("sig_1_res is stamped", groups=[g_res.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g_res.id]
+        with subtests.test("sig_2_res is stamped", groups=nested_g_res._get_task_meta()['groups']):
+            assert sig_2_res._get_task_meta()['groups'] == nested_g_res._get_task_meta()['groups']
+
+    def test_group_stamping_three_levels(self, subtests):
+        """
+        For groups with three levels of nesting, test that group stamps
+        are saved in the correct order for all nesting levels.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_in_g1_1 = self.add.s(2, 2)
+        sig_in_g1_2 = self.add.s(1, 1)
+        sig_in_g2 = self.add.s(2)
+        sig_in_g2_chain = self.add.s(4)
+        sig_in_g3_1 = self.add.s(8)
+        sig_in_g3_2 = self.add.s(16)
+
+        sig_in_g1_1_res = sig_in_g1_1.freeze()
+        sig_in_g1_2_res = sig_in_g1_2.freeze()
+        sig_in_g2_res = sig_in_g2.freeze()
+        sig_in_g2_chain_res = sig_in_g2_chain.freeze()
+        sig_in_g3_1_res = sig_in_g3_1.freeze()
+        sig_in_g3_2_res = sig_in_g3_2.freeze()
+
+        g3 = group(
+            sig_in_g3_1,
+            sig_in_g3_2,
+            app=self.app
+        )
+
+        g3_res = g3.freeze()
+
+        g2 = group(
+            sig_in_g2,
+            chain(
+                sig_in_g2_chain,
+                g3
+            ),
+            app=self.app
+        )
+
+        g2_res = g2.freeze()
+
+        g1 = group(
+            sig_in_g1_1,
+            chain(
+                sig_in_g1_2,
+                g2,
+                app=self.app
+            ),
+            app=self.app
+        )
+
+        g1_res = g1.freeze()
+        g1.apply()
+
+        with subtests.test("sig_in_g1_1_res is stamped", groups=[g1_res.id]):
+            assert sig_in_g1_1_res._get_task_meta()['groups'] == [g1_res.id]
+        with subtests.test("sig_in_g1_2_res is stamped", groups=[g1_res.id]):
+            assert sig_in_g1_2_res._get_task_meta()['groups'] == [g1_res.id]
+        with subtests.test("sig_in_g2_res is stamped", groups=[g1_res.id, g2_res.id]):
+            assert sig_in_g2_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+        with subtests.test("sig_in_g2_chain_res is stamped", groups=[g1_res.id, g2_res.id]):
+            assert sig_in_g2_chain_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+        with subtests.test("sig_in_g3_1_res is stamped", groups=[g1_res.id, g2_res.id, g3_res.id]):
+            assert sig_in_g3_1_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id, g3_res.id]
+        with subtests.test("sig_in_g3_2_res is stamped", groups=[g1_res.id, g2_res.id, g3_res.id]):
+            assert sig_in_g3_2_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id, g3_res.id]
+
+    def test_group_stamping_parallel_groups(self, subtests):
+        """
+        In the case of group within a group that is from another canvas
+        element, ensure that group stamps are added correctly when groups are
+        run in parallel.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_in_g1 = self.add.s(1, 1)
+        sig_in_g2_chain = self.add.s(2, 2)
+        sig_in_g2_1 = self.add.s(4)
+        sig_in_g2_2 = self.add.s(8)
+        sig_in_g3_chain = self.add.s(2, 2)
+        sig_in_g3_1 = self.add.s(4)
+        sig_in_g3_2 = self.add.s(8)
+
+        sig_in_g1_res = sig_in_g1.freeze(_id='sig_in_g1')
+        sig_in_g2_chain_res = sig_in_g2_chain.freeze(_id='sig_in_g2_chain')
+        sig_in_g2_1_res = sig_in_g2_1.freeze(_id='sig_in_g2_1')
+        sig_in_g2_2_res = sig_in_g2_2.freeze(_id='sig_in_g2_2')
+        sig_in_g3_chain_res = sig_in_g3_chain.freeze(_id='sig_in_g3_chain')
+        sig_in_g3_1_res = sig_in_g3_1.freeze(_id='sig_in_g3_1')
+        sig_in_g3_2_res = sig_in_g3_2.freeze(_id='sig_in_g3_2')
+
+        g3 = group(
+            sig_in_g3_1,
+            sig_in_g3_2,
+            app=self.app
+        )
+        g3_res = g3.freeze(group_id='g3')
+
+        g2 = group(
+            sig_in_g2_1,
+            sig_in_g2_2,
+            app=self.app
+        )
+        g2_res = g2.freeze(group_id='g2')
+
+        g1 = group(
+            sig_in_g1,
+            chain(
+                sig_in_g2_chain,
+                g2,
+                app=self.app
+            ),
+            chain(
+                sig_in_g3_chain,
+                g3,
+                app=self.app
+            ),
+        )
+        g1_res = g1.freeze(group_id='g1')
+        g1.apply()
+
+        with subtests.test("sig_in_g1 is stamped", groups=[g1_res.id]):
+            assert sig_in_g1_res.id == 'sig_in_g1'
+            assert sig_in_g1_res._get_task_meta()['groups'] == [g1_res.id]
+
+        with subtests.test("sig_in_g2_chain is stamped", groups=[g1_res.id]):
+            assert sig_in_g2_chain_res.id == 'sig_in_g2_chain'
+            assert sig_in_g2_chain_res._get_task_meta()['groups'] == \
+                [g1_res.id]
+
+        with subtests.test("sig_in_g2_1 is stamped", groups=[g1_res.id, g2_res.id]):
+            assert sig_in_g2_1_res.id == 'sig_in_g2_1'
+            assert sig_in_g2_1_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+
+        with subtests.test("sig_in_g2_2 is stamped",
+                           groups=[g1_res.id, g2_res.id]):
+            assert sig_in_g2_2_res.id == 'sig_in_g2_2'
+            assert sig_in_g2_2_res._get_task_meta()['groups'] == \
+                [g1_res.id, g2_res.id]
+
+        with subtests.test("sig_in_g3_chain is stamped",
+                           groups=[g1_res.id]):
+            assert sig_in_g3_chain_res.id == 'sig_in_g3_chain'
+            assert sig_in_g3_chain_res._get_task_meta()['groups'] == \
+                [g1_res.id]
+
+        with subtests.test("sig_in_g3_1 is stamped",
+                           groups=[g1_res.id, g3_res.id]):
+            assert sig_in_g3_1_res.id == 'sig_in_g3_1'
+            assert sig_in_g3_1_res._get_task_meta()['groups'] == \
+                [g1_res.id, g3_res.id]
+
+        with subtests.test("sig_in_g3_2 is stamped",
+                           groups=[g1_res.id, g3_res.id]):
+            assert sig_in_g3_2_res._get_task_meta()['groups'] == \
+                [g1_res.id, g3_res.id]
 
     def test_repr(self):
         x = group([self.add.s(2, 2), self.add.s(4, 4)])
@@ -627,6 +1101,11 @@ class test_group(CanvasCase):
         x = group([self.add.s(2, 2), self.add.s(4, 4)])
         assert isinstance(signature(x), group)
         assert isinstance(signature(dict(x)), group)
+
+    def test_reverse_with_subclass(self):
+        x = group_subclass([self.add.s(2, 2), self.add.s(4, 4)])
+        assert isinstance(signature(x), group_subclass)
+        assert isinstance(signature(dict(x)), group_subclass)
 
     def test_cannot_link_on_group(self):
         x = group([self.add.s(2, 2), self.add.s(4, 4)])
@@ -711,29 +1190,36 @@ class test_group(CanvasCase):
         finally:
             _task_stack.pop()
 
-    def test_from_dict(self):
-        x = group([self.add.s(2, 2), self.add.s(4, 4)])
+    @pytest.mark.parametrize("group_type", (group, group_subclass))
+    def test_from_dict(self, group_type):
+        x = group_type([self.add.s(2, 2), self.add.s(4, 4)])
         x['args'] = (2, 2)
-        assert group.from_dict(dict(x))
+        value = group_type.from_dict(dict(x))
+        assert value and isinstance(value, group_type)
         x['args'] = None
-        assert group.from_dict(dict(x))
+        value = group_type.from_dict(dict(x))
+        assert value and isinstance(value, group_type)
 
-    def test_from_dict_deep_deserialize(self):
-        original_group = group([self.add.s(1, 2)] * 42)
+    @pytest.mark.parametrize("group_type", (group, group_subclass))
+    def test_from_dict_deep_deserialize(self, group_type):
+        original_group = group_type([self.add.s(1, 2)] * 42)
         serialized_group = json.loads(json.dumps(original_group))
-        deserialized_group = group.from_dict(serialized_group)
+        deserialized_group = group_type.from_dict(serialized_group)
+        assert isinstance(deserialized_group, group_type)
         assert all(
             isinstance(child_task, Signature)
             for child_task in deserialized_group.tasks
         )
 
-    def test_from_dict_deeper_deserialize(self):
-        inner_group = group([self.add.s(1, 2)] * 42)
-        outer_group = group([inner_group] * 42)
+    @pytest.mark.parametrize("group_type", (group, group_subclass))
+    def test_from_dict_deeper_deserialize(self, group_type):
+        inner_group = group_type([self.add.s(1, 2)] * 42)
+        outer_group = group_type([inner_group] * 42)
         serialized_group = json.loads(json.dumps(outer_group))
-        deserialized_group = group.from_dict(serialized_group)
+        deserialized_group = group_type.from_dict(serialized_group)
+        assert isinstance(deserialized_group, group_type)
         assert all(
-            isinstance(child_task, Signature)
+            isinstance(child_task, group_type)
             for child_task in deserialized_group.tasks
         )
         assert all(
@@ -831,9 +1317,9 @@ class test_group(CanvasCase):
     def test_apply_contains_chord(self):
         gchild_count = 42
         gchild_sig = self.add.si(0, 0)
-        gchild_sigs = (gchild_sig, ) * gchild_count
+        gchild_sigs = (gchild_sig,) * gchild_count
         child_chord = chord(gchild_sigs, gchild_sig)
-        group_sig = group((child_chord, ))
+        group_sig = group((child_chord,))
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -851,10 +1337,10 @@ class test_group(CanvasCase):
     def test_apply_contains_chords_containing_chain(self):
         ggchild_count = 42
         ggchild_sig = self.add.si(0, 0)
-        gchild_sig = chain((ggchild_sig, ) * ggchild_count)
+        gchild_sig = chain((ggchild_sig,) * ggchild_count)
         child_count = 24
-        child_chord = chord((gchild_sig, ), ggchild_sig)
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), ggchild_sig)
+        group_sig = group((child_chord,) * child_count)
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -867,14 +1353,14 @@ class test_group(CanvasCase):
         assert len(res_obj.children) == child_count
         # We must have set the chord sizes based on the number of tail tasks of
         # the encapsulated chains - in this case 1 for each child chord
-        mock_set_chord_size.assert_has_calls((call(ANY, 1), ) * child_count)
+        mock_set_chord_size.assert_has_calls((call(ANY, 1),) * child_count)
 
     @pytest.mark.xfail(reason="Invalid canvas setup with bad exception")
     def test_apply_contains_chords_containing_empty_chain(self):
         gchild_sig = chain(tuple())
         child_count = 24
-        child_chord = chord((gchild_sig, ), self.add.si(0, 0))
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), self.add.si(0, 0))
+        group_sig = group((child_chord,) * child_count)
         # This is an invalid setup because we can't complete a chord header if
         # there are no actual tasks which will run in it. However, the current
         # behaviour of an `IndexError` isn't particularly helpful to a user.
@@ -885,11 +1371,11 @@ class test_group(CanvasCase):
         ggchild_sig = self.add.si(0, 0)
         tail_count = 24
         gchild_sig = chain(
-            (ggchild_sig, ) * ggchild_count +
-            (group((ggchild_sig, ) * tail_count), group(tuple()), ),
+            (ggchild_sig,) * ggchild_count +
+            (group((ggchild_sig,) * tail_count), group(tuple()),),
         )
-        child_chord = chord((gchild_sig, ), ggchild_sig)
-        group_sig = group((child_chord, ))
+        child_chord = chord((gchild_sig,), ggchild_sig)
+        group_sig = group((child_chord,))
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -908,10 +1394,10 @@ class test_group(CanvasCase):
     def test_apply_contains_chords_containing_group(self):
         ggchild_count = 42
         ggchild_sig = self.add.si(0, 0)
-        gchild_sig = group((ggchild_sig, ) * ggchild_count)
+        gchild_sig = group((ggchild_sig,) * ggchild_count)
         child_count = 24
-        child_chord = chord((gchild_sig, ), ggchild_sig)
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), ggchild_sig)
+        group_sig = group((child_chord,) * child_count)
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -925,15 +1411,15 @@ class test_group(CanvasCase):
         # We must have set the chord sizes based on the number of tail tasks of
         # the encapsulated groups - in this case `ggchild_count`
         mock_set_chord_size.assert_has_calls(
-            (call(ANY, ggchild_count), ) * child_count,
+            (call(ANY, ggchild_count),) * child_count,
         )
 
     @pytest.mark.xfail(reason="Invalid canvas setup but poor behaviour")
     def test_apply_contains_chords_containing_empty_group(self):
         gchild_sig = group(tuple())
         child_count = 24
-        child_chord = chord((gchild_sig, ), self.add.si(0, 0))
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), self.add.si(0, 0))
+        group_sig = group((child_chord,) * child_count)
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -948,15 +1434,15 @@ class test_group(CanvasCase):
         # chain test, this is an invalid setup. However, we should probably
         # expect that the chords are dealt with in some other way the probably
         # being left incomplete forever...
-        mock_set_chord_size.assert_has_calls((call(ANY, 0), ) * child_count)
+        mock_set_chord_size.assert_has_calls((call(ANY, 0),) * child_count)
 
     def test_apply_contains_chords_containing_chord(self):
         ggchild_count = 42
         ggchild_sig = self.add.si(0, 0)
-        gchild_sig = chord((ggchild_sig, ) * ggchild_count, ggchild_sig)
+        gchild_sig = chord((ggchild_sig,) * ggchild_count, ggchild_sig)
         child_count = 24
-        child_chord = chord((gchild_sig, ), ggchild_sig)
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), ggchild_sig)
+        group_sig = group((child_chord,) * child_count)
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -972,14 +1458,14 @@ class test_group(CanvasCase):
         # child chord. This means we have `child_count` interleaved calls to
         # set chord sizes of 1 and `ggchild_count`.
         mock_set_chord_size.assert_has_calls(
-            (call(ANY, 1), call(ANY, ggchild_count), ) * child_count,
+            (call(ANY, 1), call(ANY, ggchild_count),) * child_count,
         )
 
     def test_apply_contains_chords_containing_empty_chord(self):
         gchild_sig = chord(tuple(), self.add.si(0, 0))
         child_count = 24
-        child_chord = chord((gchild_sig, ), self.add.si(0, 0))
-        group_sig = group((child_chord, ) * child_count)
+        child_chord = chord((gchild_sig,), self.add.si(0, 0))
+        group_sig = group((child_chord,) * child_count)
         with patch.object(
             self.app.backend, "set_chord_size",
         ) as mock_set_chord_size, patch(
@@ -992,10 +1478,165 @@ class test_group(CanvasCase):
         assert len(res_obj.children) == child_count
         # We must have set the chord sizes based on the number of tail tasks of
         # the encapsulated chains - in this case 1 for each child chord
-        mock_set_chord_size.assert_has_calls((call(ANY, 1), ) * child_count)
+        mock_set_chord_size.assert_has_calls((call(ANY, 1),) * child_count)
 
 
 class test_chord(CanvasCase):
+    def test_chord_stamping_one_level(self, subtests):
+        """
+        In the case of group within a chord that is from another canvas
+        element, ensure that chord stamps are added correctly when chord are
+        run in parallel.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(4, 4)
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+        sig_sum = self.xsum.s()
+        sig_sum_res = sig_sum.freeze()
+
+        g = chord([sig_1, sig_2], sig_sum, app=self.app)
+        g.stamp(stamp="stamp")
+        g.freeze()
+        g.apply()
+
+        with subtests.test("sig_sum_res body isn't stamped", groups=[]):
+            assert sig_sum_res._get_task_meta()['groups'] == []
+
+        with subtests.test("sig_1_res is stamped", groups=[g.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g.id]
+
+        with subtests.test("sig_2_res is stamped", groups=[g.id]):
+            assert sig_2_res._get_task_meta()['groups'] == [g.id]
+
+        with subtests.test("sig_1_res is stamped manually", stamp=["stamp"]):
+            assert sig_1_res._get_task_meta()['stamp'] == ["stamp"]
+
+        with subtests.test("sig_2_res is stamped manually", stamp=["stamp"]):
+            assert sig_2_res._get_task_meta()['stamp'] == ["stamp"]
+
+        with subtests.test("sig_1_res has stamped_headers", stamped_headers=["stamp", 'groups']):
+            assert sig_1_res._get_task_meta()['stamped_headers'] == ['stamp', 'groups']
+
+        with subtests.test("sig_2_res has stamped_headers", stamped_headers=["stamp", 'groups']):
+            assert sig_2_res._get_task_meta()['stamped_headers'] == ['stamp', 'groups']
+
+    def test_chord_stamping_two_levels(self, subtests):
+        """
+        For a group within a chord, test that group stamps are stored in
+        the correct order.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        sig_1 = self.add.s(2, 2)
+        sig_2 = self.add.s(1, 1)
+        nested_sig_1 = self.add.s(2)
+        nested_sig_2 = self.add.s(4)
+
+        sig_1_res = sig_1.freeze()
+        sig_2_res = sig_2.freeze()
+        first_nested_sig_res = nested_sig_1.freeze()
+        second_nested_sig_res = nested_sig_2.freeze()
+
+        g2 = group(
+            nested_sig_1,
+            nested_sig_2,
+            app=self.app
+        )
+
+        g2_res = g2.freeze()
+
+        sig_sum = self.xsum.s()
+        sig_sum.freeze()
+
+        g1 = chord([sig_2, chain(sig_1, g2)], sig_sum, app=self.app)
+
+        g1.freeze()
+        g1.apply()
+
+        with subtests.test("sig_1_res body is stamped", groups=[g1.id]):
+            assert sig_1_res._get_task_meta()['groups'] == [g1.id]
+        with subtests.test("sig_2_res body is stamped", groups=[g1.id]):
+            assert sig_2_res._get_task_meta()['groups'] == [g1.id]
+        with subtests.test("first_nested_sig_res body is stamped", groups=[g1.id, g2_res.id]):
+            assert first_nested_sig_res._get_task_meta()['groups'] == \
+                [g1.id, g2_res.id]
+        with subtests.test("second_nested_sig_res body is stamped", groups=[g1.id, g2_res.id]):
+            assert second_nested_sig_res._get_task_meta()['groups'] == \
+                [g1.id, g2_res.id]
+
+    def test_chord_stamping_body_group(self, subtests):
+        """
+        In the case of group within a chord that is from another canvas
+        element, ensure that chord stamps are added correctly when chord are
+        run in parallel.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        tasks = [self.add.s(i, i) for i in range(10)]
+
+        sum_task = self.xsum.s()
+        sum_task_res = sum_task.freeze()
+        prod_task = self.xprod.s()
+        prod_task_res = sum_task.freeze()
+
+        body = group(sum_task, prod_task)
+
+        g = chord(tasks, body, app=self.app)
+        g.freeze()
+        g.apply()
+
+        with subtests.test("sum_task_res is stamped", groups=[body.id]):
+            assert sum_task_res._get_task_meta()['groups'] == [body.id]
+        with subtests.test("prod_task_res is stamped", groups=[body.id]):
+            assert prod_task_res._get_task_meta()['groups'] == [body.id]
+
+    def test_chord_stamping_body_chord(self, subtests):
+        """
+        In the case of chord within a chord that is from another canvas
+        element, ensure that chord stamps are added correctly when chord are
+        run in parallel.
+        """
+        self.app.conf.task_always_eager = True
+        self.app.conf.task_store_eager_result = True
+        self.app.conf.result_extended = True
+
+        parent_header_tasks = group([self.add.s(i, i) for i in range(10)])
+        parent_header_tasks_res = parent_header_tasks.freeze()
+
+        sum_task = self.xsum.s()
+        sum_task_res = sum_task.freeze()
+        sum_task2 = self.xsum.s()
+        sum_task_res2 = sum_task2.freeze()
+        prod_task = self.xprod.s()
+        prod_task_res = sum_task.freeze()
+
+        body = chord(group(sum_task, prod_task), sum_task2, app=self.app)
+
+        c = chord(parent_header_tasks, body, app=self.app)
+        c.freeze()
+        c.apply()
+
+        with subtests.test("parent_header_tasks are stamped", groups=[c.id]):
+            for ar in parent_header_tasks_res.children:
+                assert ar._get_task_meta()['groups'] == [c.id]
+                assert ar._get_task_meta()['groups'] != [body.id]
+        with subtests.test("sum_task_res is stamped", groups=[body.id]):
+            assert sum_task_res._get_task_meta()['groups'] == [body.id]
+            assert sum_task_res._get_task_meta()['groups'] != [c.id]
+        with subtests.test("prod_task_res is stamped", groups=[body.id]):
+            assert prod_task_res._get_task_meta()['groups'] == [body.id]
+            assert prod_task_res._get_task_meta()['groups'] != [c.id]
+        with subtests.test("sum_task_res2 is NOT stamped", groups=[]):
+            assert len(sum_task_res2._get_task_meta()['groups']) == 0
 
     def test__get_app_does_not_exhaust_generator(self):
         def build_generator():
@@ -1012,10 +1653,11 @@ class test_chord(CanvasCase):
         # Access it again to make sure the generator is not further evaluated
         c.app
 
-    def test_reverse(self):
-        x = chord([self.add.s(2, 2), self.add.s(4, 4)], body=self.mul.s(4))
-        assert isinstance(signature(x), chord)
-        assert isinstance(signature(dict(x)), chord)
+    @pytest.mark.parametrize("chord_type", [chord, chord_subclass])
+    def test_reverse(self, chord_type):
+        x = chord_type([self.add.s(2, 2), self.add.s(4, 4)], body=self.mul.s(4))
+        assert isinstance(signature(x), chord_type)
+        assert isinstance(signature(dict(x)), chord_type)
 
     def test_clone_clones_body(self):
         x = chord([self.add.s(2, 2), self.add.s(4, 4)], body=self.mul.s(4))
@@ -1212,7 +1854,7 @@ class test_chord(CanvasCase):
         with patch(
             "celery.canvas.Signature.from_dict", return_value=child_sig
         ) as mock_from_dict:
-            assert chord_sig. __length_hint__() == 1
+            assert chord_sig.__length_hint__() == 1
         mock_from_dict.assert_called_once_with(deserialized_child_sig)
 
     def test_chord_size_deserialized_element_many(self):
@@ -1226,7 +1868,7 @@ class test_chord(CanvasCase):
         with patch(
             "celery.canvas.Signature.from_dict", return_value=child_sig
         ) as mock_from_dict:
-            assert chord_sig. __length_hint__() == 42
+            assert chord_sig.__length_hint__() == 42
         mock_from_dict.assert_has_calls([call(deserialized_child_sig)] * 42)
 
     def test_set_immutable(self):
@@ -1252,15 +1894,18 @@ class test_chord(CanvasCase):
         x.kwargs['body'] = None
         assert 'without body' in repr(x)
 
-    def test_freeze_tasks_body_is_group(self, subtests):
+    @pytest.mark.parametrize("group_type", [group,  group_subclass])
+    def test_freeze_tasks_body_is_group(self, subtests, group_type):
         # Confirm that `group index` values counting up from 0 are set for
         # elements of a chord's body when the chord is encapsulated in a group
         body_elem = self.add.s()
-        chord_body = group([body_elem] * 42)
+        chord_body = group_type([body_elem] * 42)
         chord_obj = chord(self.add.s(), body=chord_body)
-        top_group = group([chord_obj])
+        top_group = group_type([chord_obj])
+
         # We expect the body to be the signature we passed in before we freeze
-        with subtests.test(msg="Validate body tasks are retained"):
+        with subtests.test(msg="Validate body type and tasks are retained"):
+            assert isinstance(chord_obj.body, group_type)
             assert all(
                 embedded_body_elem is body_elem
                 for embedded_body_elem in chord_obj.body.tasks
@@ -1273,6 +1918,8 @@ class test_chord(CanvasCase):
         with subtests.test(
             msg="Validate body group indices count from 0 after freezing"
         ):
+            assert isinstance(chord_obj.body, group_type)
+
             assert all(
                 embedded_body_elem is not body_elem
                 for embedded_body_elem in chord_obj.body.tasks
@@ -1310,17 +1957,19 @@ class test_chord(CanvasCase):
             _state.task_join_will_block = fixture_task_join_will_block
             result.task_join_will_block = fixture_task_join_will_block
 
-    def test_from_dict(self):
+    @pytest.mark.parametrize("chord_type", [chord, chord_subclass])
+    def test_from_dict(self, chord_type):
         header = self.add.s(1, 2)
-        original_chord = chord(header=header)
-        rebuilt_chord = chord.from_dict(dict(original_chord))
-        assert isinstance(rebuilt_chord, chord)
+        original_chord = chord_type(header=header)
+        rebuilt_chord = chord_type.from_dict(dict(original_chord))
+        assert isinstance(rebuilt_chord, chord_type)
 
-    def test_from_dict_with_body(self):
+    @pytest.mark.parametrize("chord_type", [chord, chord_subclass])
+    def test_from_dict_with_body(self, chord_type):
         header = body = self.add.s(1, 2)
-        original_chord = chord(header=header, body=body)
-        rebuilt_chord = chord.from_dict(dict(original_chord))
-        assert isinstance(rebuilt_chord, chord)
+        original_chord = chord_type(header=header, body=body)
+        rebuilt_chord = chord_type.from_dict(dict(original_chord))
+        assert isinstance(rebuilt_chord, chord_type)
 
     def test_from_dict_deep_deserialize(self, subtests):
         header = body = self.add.s(1, 2)
@@ -1337,8 +1986,9 @@ class test_chord(CanvasCase):
         with subtests.test(msg="Verify chord body is deserialized"):
             assert isinstance(deserialized_chord.body, Signature)
 
-    def test_from_dict_deep_deserialize_group(self, subtests):
-        header = body = group([self.add.s(1, 2)] * 42)
+    @pytest.mark.parametrize("group_type", [group, group_subclass])
+    def test_from_dict_deep_deserialize_group(self, subtests, group_type):
+        header = body = group_type([self.add.s(1, 2)] * 42)
         original_chord = chord(header=header, body=body)
         serialized_chord = json.loads(json.dumps(original_chord))
         deserialized_chord = chord.from_dict(serialized_chord)
@@ -1350,22 +2000,23 @@ class test_chord(CanvasCase):
         ):
             assert all(
                 isinstance(child_task, Signature)
-                and not isinstance(child_task, group)
+                and not isinstance(child_task, group_type)
                 for child_task in deserialized_chord.tasks
             )
         # A body which is a group remains as it we passed in
         with subtests.test(
             msg="Validate chord body is deserialized and not unpacked"
         ):
-            assert isinstance(deserialized_chord.body, group)
+            assert isinstance(deserialized_chord.body, group_type)
             assert all(
                 isinstance(body_child_task, Signature)
                 for body_child_task in deserialized_chord.body.tasks
             )
 
-    def test_from_dict_deeper_deserialize_group(self, subtests):
-        inner_group = group([self.add.s(1, 2)] * 42)
-        header = body = group([inner_group] * 42)
+    @pytest.mark.parametrize("group_type", [group, group_subclass])
+    def test_from_dict_deeper_deserialize_group(self, subtests, group_type):
+        inner_group = group_type([self.add.s(1, 2)] * 42)
+        header = body = group_type([inner_group] * 42)
         original_chord = chord(header=header, body=body)
         serialized_chord = json.loads(json.dumps(original_chord))
         deserialized_chord = chord.from_dict(serialized_chord)
@@ -1376,7 +2027,7 @@ class test_chord(CanvasCase):
             msg="Validate chord header tasks are deserialized and unpacked"
         ):
             assert all(
-                isinstance(child_task, group)
+                isinstance(child_task, group_type)
                 for child_task in deserialized_chord.tasks
             )
             assert all(
@@ -1420,6 +2071,55 @@ class test_chord(CanvasCase):
             msg="Validate chord body is deserialized and not unpacked"
         ):
             assert isinstance(deserialized_chord.body, _chain)
+
+    def test_chord_clone_kwargs(self, subtests):
+        """ Test that chord clone ensures the kwargs are the same """
+
+        with subtests.test(msg='Verify chord cloning clones kwargs correctly'):
+            c = chord([signature('g'), signature('h')], signature('i'), kwargs={'U': 6})
+            c2 = c.clone()
+            assert c2.kwargs == c.kwargs
+
+        with subtests.test(msg='Cloning the chord with overridden kwargs'):
+            override_kw = {'X': 2}
+            c3 = c.clone(args=(1,), kwargs=override_kw)
+
+        with subtests.test(msg='Verify the overridden kwargs were cloned correctly'):
+            new_kw = c.kwargs.copy()
+            new_kw.update(override_kw)
+            assert c3.kwargs == new_kw
+
+    def test_flag_allow_error_cb_on_chord_header(self, subtests):
+        header_mock = [Mock(name='t1'), Mock(name='t2')]
+        header = group(header_mock)
+        body = Mock(name='tbody')
+        errback_sig = Mock(name='errback_sig')
+        chord_sig = chord(header, body, app=self.app)
+
+        with subtests.test(msg='Verify the errback is not linked'):
+            # header
+            for child_sig in header_mock:
+                child_sig.link_error.assert_not_called()
+            # body
+            body.link_error.assert_not_called()
+
+        with subtests.test(msg='Verify flag turned off links only the body'):
+            self.app.conf.task_allow_error_cb_on_chord_header = False
+            chord_sig.link_error(errback_sig)
+            # header
+            for child_sig in header_mock:
+                child_sig.link_error.assert_not_called()
+            # body
+            body.link_error.assert_called_once_with(errback_sig)
+
+        with subtests.test(msg='Verify flag turned on links the header'):
+            self.app.conf.task_allow_error_cb_on_chord_header = True
+            chord_sig.link_error(errback_sig)
+            # header
+            for child_sig in header_mock:
+                child_sig.link_error.assert_called_once_with(errback_sig)
+            # body
+            body.link_error.assert_has_calls([call(errback_sig), call(errback_sig)])
 
 
 class test_maybe_signature(CanvasCase):

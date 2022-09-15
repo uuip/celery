@@ -28,8 +28,8 @@ __all__ = (
 
 E_WOULDBLOCK = """\
 Never call result.get() within a task!
-See http://docs.celeryq.org/en/latest/userguide/tasks.html\
-#task-synchronous-subtasks
+See https://docs.celeryq.dev/en/latest/userguide/tasks.html\
+#avoid-launching-synchronous-subtasks
 """
 
 
@@ -300,13 +300,15 @@ class AsyncResult(ResultBase):
     def iterdeps(self, intermediate=False):
         stack = deque([(None, self)])
 
+        is_incomplete_stream = not intermediate
+
         while stack:
             parent, node = stack.popleft()
             yield parent, node
             if node.ready():
                 stack.extend((node, child) for child in node.children or [])
             else:
-                if not intermediate:
+                if is_incomplete_stream:
                     raise IncompleteStream()
 
     def ready(self):

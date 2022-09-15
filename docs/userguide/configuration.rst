@@ -151,6 +151,7 @@ have been moved into a new  ``task_`` prefix.
 ``CELERY_TASK_TRACK_STARTED``              :setting:`task_track_started`
 ``CELERY_TASK_REJECT_ON_WORKER_LOST``      :setting:`task_reject_on_worker_lost`
 ``CELERYD_TIME_LIMIT``                     :setting:`task_time_limit`
+``CELERY_ALLOW_ERROR_CB_ON_CHORD_HEADER``  :setting:`task_allow_error_cb_on_chord_header`
 ``CELERYD_AGENT``                          :setting:`worker_agent`
 ``CELERYD_AUTOSCALER``                     :setting:`worker_autoscaler`
 ``CELERYD_CONCURRENCY``                    :setting:`worker_concurrency`
@@ -511,6 +512,57 @@ Default: No time limit.
 Task hard time limit in seconds. The worker processing the task will
 be killed and replaced with a new one when this is exceeded.
 
+.. setting:: task_allow_error_cb_on_chord_header
+
+``task_allow_error_cb_on_chord_header``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.3
+
+Default: Disabled.
+
+Enabling this flag will allow linking an error callback to a chord header,
+which by default will not link when using :code:`link_error()`, and preventing
+from the chord's body to execute if any of the tasks in the header fails.
+
+Consider the following canvas with the flag disabled (default behavior):
+
+.. code-block:: python
+
+    header = group([t1, t2])
+    body = t3
+    c = chord(header, body)
+    c.link_error(error_callback_sig)
+
+If *any* of the header tasks failed (:code:`t1` or :code:`t2`), by default, the chord body (:code:`t3`) would **not execute**, and :code:`error_callback_sig` will be called **once** (for the body).
+
+Enabling this flag will change the above behavior by:
+
+1. :code:`error_callback_sig` will be linked to :code:`t1` and :code:`t2` (as well as :code:`t3`).
+2. If *any* of the header tasks failed, :code:`error_callback_sig` will be called **for each** failed header task **and** the :code:`body` (even if the body didn't run).
+
+Consider now the following canvas with the flag enabled:
+
+.. code-block:: python
+
+    header = group([failingT1, failingT2])
+    body = t3
+    c = chord(header, body)
+    c.link_error(error_callback_sig)
+
+If *all* of the header tasks failed (:code:`failingT1` and :code:`failingT2`), then the chord body (:code:`t3`) would **not execute**, and :code:`error_callback_sig` will be called **3 times** (two times for the header and one time for the body).
+
+Lastly, consider the following canvas with the flag enabled:
+
+.. code-block:: python
+
+    header = group([failingT1, failingT2])
+    body = t3
+    upgraded_chord = chain(header, body)
+    upgraded_chord.link_error(error_callback_sig)
+
+This canvas will behave exactly the same as the previous one, since the :code:`chain` will be upgraded to a :code:`chord` internally.
+
 .. setting:: task_soft_time_limit
 
 ``task_soft_time_limit``
@@ -596,7 +648,7 @@ This value is used for tasks that doesn't have a custom rate limit
 
 .. seealso::
 
-    The setting:`worker_disable_rate_limits` setting can
+    The :setting:`worker_disable_rate_limits` setting can
     disable all rate limits.
 
 .. _conf-result-backend:
@@ -854,9 +906,6 @@ Default: 1.0.
 
 Default interval for retrying chord tasks.
 
-.. _conf-database-result-backend:
-
-
 .. setting:: override_backends
 
 ``override_backends``
@@ -876,7 +925,7 @@ Example:
 
     override_backends = {"db": "custom_module.backend.class"}
 
-
+.. _conf-database-result-backend:
 
 Database backend settings
 -------------------------
@@ -1314,12 +1363,18 @@ used by the redis result backend.
 
 .. _conf-cassandra-result-backend:
 
-Cassandra backend settings
---------------------------
+Cassandra/AstraDB backend settings
+----------------------------------
 
 .. note::
 
     This Cassandra backend driver requires :pypi:`cassandra-driver`.
+
+    This backend can refer to either a regular Cassandra installation
+    or a managed Astra DB instance. Depending on which one, exactly one
+    between the :setting:`cassandra_servers` and
+    :setting:`cassandra_secure_bundle_path` settings must be provided
+    (but not both).
 
     To install, use :command:`pip`:
 
@@ -1339,9 +1394,31 @@ This backend requires the following configuration directives to be set.
 
 Default: ``[]`` (empty list).
 
-List of ``host`` Cassandra servers. For example::
+List of ``host`` Cassandra servers. This must be provided when connecting to
+a Cassandra cluster. Passing this setting is strictly exclusive
+to :setting:`cassandra_secure_bundle_path`. Example::
 
     cassandra_servers = ['localhost']
+
+.. setting:: cassandra_secure_bundle_path
+
+``cassandra_secure_bundle_path``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: None.
+
+Absolute path to the secure-connect-bundle zip file to connect
+to an Astra DB instance. Passing this setting is strictly exclusive
+to :setting:`cassandra_servers`.
+Example::
+
+    cassandra_secure_bundle_path = '/home/user/bundles/secure-connect.zip'
+
+When connecting to Astra DB, it is necessary to specify
+the plain-text auth provider and the associated username and password,
+which take the value of the Client ID and the Client Secret, respectively,
+of a valid token generated for the Astra DB instance.
+See below for an Astra DB configuration example.
 
 .. setting:: cassandra_port
 
@@ -1359,7 +1436,7 @@ Port to contact the Cassandra servers on.
 
 Default: None.
 
-The key-space in which to store the results. For example::
+The keyspace in which to store the results. For example::
 
     cassandra_keyspace = 'tasks_keyspace'
 
@@ -1446,17 +1523,84 @@ Named arguments to pass into the ``cassandra.cluster`` class.
         'protocol_version': 3
     }
 
-Example configuration
-~~~~~~~~~~~~~~~~~~~~~
+Example configuration (Cassandra)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
+    result_backend = 'cassandra://'
     cassandra_servers = ['localhost']
     cassandra_keyspace = 'celery'
     cassandra_table = 'tasks'
-    cassandra_read_consistency = 'ONE'
-    cassandra_write_consistency = 'ONE'
+    cassandra_read_consistency = 'QUORUM'
+    cassandra_write_consistency = 'QUORUM'
     cassandra_entry_ttl = 86400
+
+Example configuration (Astra DB)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    result_backend = 'cassandra://'
+    cassandra_keyspace = 'celery'
+    cassandra_table = 'tasks'
+    cassandra_read_consistency = 'QUORUM'
+    cassandra_write_consistency = 'QUORUM'
+    cassandra_auth_provider = 'PlainTextAuthProvider'
+    cassandra_auth_kwargs = {
+      'username': '<<CLIENT_ID_FROM_ASTRA_DB_TOKEN>>',
+      'password': '<<CLIENT_SECRET_FROM_ASTRA_DB_TOKEN>>'
+    }
+    cassandra_secure_bundle_path = '/path/to/secure-connect-bundle.zip'
+    cassandra_entry_ttl = 86400
+
+Additional configuration
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Cassandra driver, when estabilishing the connection, undergoes a stage
+of negotiating the protocol version with the server(s). Similarly,
+a load-balancing policy is automatically supplied (by default
+``DCAwareRoundRobinPolicy``, which in turn has a ``local_dc`` setting, also
+determined by the driver upon connection).
+When possible, one should explicitly provide these in the configuration:
+moreover, future versions of the Cassandra driver will require at least the
+load-balancing policy to be specified (using `execution profiles <https://docs.datastax.com/en/developer/python-driver/3.25/execution_profiles/>`_,
+as shown below).
+
+A full configuration for the Cassandra backend would thus have the
+following additional lines:
+
+.. code-block:: python
+
+    from cassandra.policies import DCAwareRoundRobinPolicy
+    from cassandra.cluster import ExecutionProfile
+    from cassandra.cluster import EXEC_PROFILE_DEFAULT
+    myEProfile = ExecutionProfile(
+      load_balancing_policy=DCAwareRoundRobinPolicy(
+        local_dc='datacenter1', # replace with your DC name
+      )
+    )
+    cassandra_options = {
+      'protocol_version': 5,    # for Cassandra 4, change if needed
+      'execution_profiles': {EXEC_PROFILE_DEFAULT: myEProfile},
+    }
+
+And similarly for Astra DB:
+
+.. code-block:: python
+
+    from cassandra.policies import DCAwareRoundRobinPolicy
+    from cassandra.cluster import ExecutionProfile
+    from cassandra.cluster import EXEC_PROFILE_DEFAULT
+    myEProfile = ExecutionProfile(
+      load_balancing_policy=DCAwareRoundRobinPolicy(
+        local_dc='europe-west1',  # for Astra DB, region name = dc name
+      )
+    )
+    cassandra_options = {
+      'protocol_version': 4,      # for Astra DB
+      'execution_profiles': {EXEC_PROFILE_DEFAULT: myEProfile},
+    }
 
 .. _conf-s3-result-backend:
 
@@ -1586,7 +1730,7 @@ The name for the storage container in which to store the results.
 .. setting:: azureblockblob_base_path
 
 ``azureblockblob_base_path``
-~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. versionadded:: 5.1
 
@@ -1634,7 +1778,7 @@ Timeout in seconds for establishing the azure block blob connection.
 .. setting:: azureblockblob_read_timeout
 
 ``azureblockblob_read_timeout``
-~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Default: 120.
 
@@ -2087,7 +2231,9 @@ or::
 
 The backend will store results in the K/V store of Consul
 as individual keys. The backend supports auto expire of results using TTLs in
-Consul. The full syntax of the URL is::
+Consul. The full syntax of the URL is:
+
+.. code-block:: text
 
     consul://host:port[?one_client=1]
 

@@ -8,7 +8,8 @@ from celery import group
 
 from .conftest import get_active_redis_channels
 from .tasks import (ClassBasedAutoRetryTask, ExpectedException, add, add_ignore_result, add_not_typed, fail,
-                    print_unicode, retry, retry_once, retry_once_priority, return_properties, sleeping)
+                    print_unicode, retry, retry_once, retry_once_headers, retry_once_priority, return_properties,
+                    sleeping)
 
 TIMEOUT = 10
 
@@ -27,7 +28,7 @@ class test_class_based_tasks:
     def test_class_based_task_retried(self, celery_session_app,
                                       celery_session_worker):
         task = ClassBasedAutoRetryTask()
-        celery_session_app.tasks.register(task)
+        celery_session_app.register_task(task)
         res = task.delay()
         assert res.get(timeout=TIMEOUT) == 1
 
@@ -220,7 +221,7 @@ class test_tasks:
             result.get(timeout=5)
         assert result.status == 'FAILURE'
 
-    @flaky
+    @pytest.mark.xfail(reason="Retry failed on rpc backend", strict=False)
     def test_retry(self, manager):
         """Tests retrying of task."""
         # Tests when max. retries is reached
@@ -253,14 +254,26 @@ class test_tasks:
         manager.assert_accepted([r1.id])
 
     @flaky
-    def test_task_retried(self):
+    def test_task_retried_once(self, manager):
         res = retry_once.delay()
         assert res.get(timeout=TIMEOUT) == 1  # retried once
 
     @flaky
-    def test_task_retried_priority(self):
+    def test_task_retried_once_with_expires(self, manager):
+        res = retry_once.delay(expires=60)
+        assert res.get(timeout=TIMEOUT) == 1  # retried once
+
+    @flaky
+    def test_task_retried_priority(self, manager):
         res = retry_once_priority.apply_async(priority=7)
         assert res.get(timeout=TIMEOUT) == 7  # retried once with priority 7
+
+    @flaky
+    def test_task_retried_headers(self, manager):
+        res = retry_once_headers.apply_async(headers={'x-test-header': 'test-value'})
+        headers = res.get(timeout=TIMEOUT)
+        assert headers is not None  # retried once with headers
+        assert 'x-test-header' in headers  # retry keeps custom headers
 
     @flaky
     def test_unicode_task(self, manager):
@@ -275,29 +288,43 @@ class test_tasks:
         assert res.get(timeout=TIMEOUT)["app_id"] == "1234"
 
 
-class tests_task_redis_result_backend:
-    def setup(self, manager):
+class test_task_redis_result_backend:
+    @pytest.fixture()
+    def manager(self, manager):
         if not manager.app.conf.result_backend.startswith('redis'):
             raise pytest.skip('Requires redis result backend.')
 
-    def test_ignoring_result_no_subscriptions(self):
-        assert get_active_redis_channels() == []
+        return manager
+
+    def test_ignoring_result_no_subscriptions(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add_ignore_result.delay(1, 2)
         assert result.ignored is True
-        assert get_active_redis_channels() == []
 
-    def test_asyncresult_forget_cancels_subscription(self):
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []
+
+    def test_asyncresult_forget_cancels_subscription(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add.delay(1, 2)
-        assert get_active_redis_channels() == [
-            f"celery-task-meta-{result.id}"
-        ]
+        assert set(get_active_redis_channels()) == {
+            f"celery-task-meta-{result.id}".encode(), *channels_before_test
+        }
         result.forget()
-        assert get_active_redis_channels() == []
 
-    def test_asyncresult_get_cancels_subscription(self):
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []
+
+    def test_asyncresult_get_cancels_subscription(self, manager):
+        channels_before_test = get_active_redis_channels()
+
         result = add.delay(1, 2)
-        assert get_active_redis_channels() == [
-            f"celery-task-meta-{result.id}"
-        ]
+        assert set(get_active_redis_channels()) == {
+            f"celery-task-meta-{result.id}".encode(), *channels_before_test
+        }
         assert result.get(timeout=3) == 3
-        assert get_active_redis_channels() == []
+
+        new_channels = [channel for channel in get_active_redis_channels() if channel not in channels_before_test]
+        assert new_channels == []

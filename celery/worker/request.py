@@ -154,7 +154,7 @@ class Request:
             'exchange': delivery_info.get('exchange'),
             'routing_key': delivery_info.get('routing_key'),
             'priority': properties.get('priority'),
-            'redelivered': delivery_info.get('redelivered'),
+            'redelivered': delivery_info.get('redelivered', False),
         }
         self._request_dict.update({
             'properties': properties,
@@ -313,6 +313,18 @@ class Request:
     @property
     def replaced_task_nesting(self):
         return self._request_dict.get('replaced_task_nesting', 0)
+
+    @property
+    def groups(self):
+        return self._request_dict.get('groups', [])
+
+    @property
+    def stamped_headers(self) -> list:
+        return self._request_dict.get('stamped_headers', [])
+
+    @property
+    def stamps(self) -> dict:
+        return {header: self._request_dict[header] for header in self.stamped_headers}
 
     @property
     def correlation_id(self):

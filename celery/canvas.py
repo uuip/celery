@@ -7,6 +7,8 @@
 
 import itertools
 import operator
+import warnings
+from abc import ABCMeta, abstractmethod
 from collections import deque
 from collections.abc import MutableSequence
 from copy import deepcopy
@@ -21,12 +23,13 @@ from kombu.utils.uuid import uuid
 from vine import barrier
 
 from celery._state import current_app
+from celery.exceptions import CPendingDeprecationWarning
 from celery.result import GroupResult, allow_join_result
 from celery.utils import abstract
 from celery.utils.collections import ChainMap
 from celery.utils.functional import _regen
 from celery.utils.functional import chunks as _chunks
-from celery.utils.functional import is_list, lookahead, maybe_list, regen, seq_concat_item, seq_concat_seq
+from celery.utils.functional import is_list, maybe_list, regen, seq_concat_item, seq_concat_seq
 from celery.utils.objects import getitem_property
 from celery.utils.text import remove_repeating_from_task, truncate
 
@@ -54,6 +57,150 @@ def maybe_unroll_group(group):
 
 def task_name_from(task):
     return getattr(task, 'name', task)
+
+
+def _stamp_regen_task(task, visitor, **headers):
+    task.stamp(visitor=visitor, **headers)
+    return task
+
+
+def _merge_dictionaries(d1, d2):
+    for key, value in d1.items():
+        if key in d2:
+            if isinstance(value, dict):
+                _merge_dictionaries(d1[key], d2[key])
+            else:
+                if isinstance(value, (int, float, str)):
+                    d1[key] = [value]
+                if isinstance(d2[key], list):
+                    d1[key].extend(d2[key])
+                else:
+                    if d1[key] is None:
+                        d1[key] = []
+                    else:
+                        d1[key] = list(d1[key])
+                    d1[key].append(d2[key])
+    for key, value in d2.items():
+        if key not in d1:
+            d1[key] = value
+
+
+class StampingVisitor(metaclass=ABCMeta):
+    """Stamping API.  A class that provides a stamping API possibility for
+    canvas primitives. If you want to implement stamping behavior for
+    a canvas primitive override method that represents it.
+    """
+
+    def on_group_start(self, group, **headers) -> dict:
+        """Method that is called on group stamping start.
+
+         Arguments:
+             group (group): Group that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         Returns:
+             Dict: headers to update.
+         """
+        return {}
+
+    def on_group_end(self, group, **headers) -> None:
+        """Method that is called on group stamping end.
+
+         Arguments:
+             group (group): Group that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         """
+        pass
+
+    def on_chain_start(self, chain, **headers) -> dict:
+        """Method that is called on chain stamping start.
+
+         Arguments:
+             chain (chain): Chain that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         Returns:
+             Dict: headers to update.
+         """
+        return {}
+
+    def on_chain_end(self, chain, **headers) -> None:
+        """Method that is called on chain stamping end.
+
+         Arguments:
+             chain (chain): Chain that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         """
+        pass
+
+    @abstractmethod
+    def on_signature(self, sig, **headers) -> dict:
+        """Method that is called on signature stamping.
+
+         Arguments:
+             sig (Signature): Signature that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         Returns:
+             Dict: headers to update.
+         """
+        pass
+
+    def on_chord_header_start(self, chord, **header) -> dict:
+        """Method that is called on сhord header stamping start.
+
+         Arguments:
+             chord (chord): chord that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         Returns:
+             Dict: headers to update.
+         """
+        if not isinstance(chord.tasks, group):
+            chord.tasks = group(chord.tasks)
+        return self.on_group_start(chord.tasks, **header)
+
+    def on_chord_header_end(self, chord, **header) -> None:
+        """Method that is called on сhord header stamping end.
+
+           Arguments:
+               chord (chord): chord that is stamped.
+               headers (Dict): Partial headers that could be merged with existing headers.
+        """
+        self.on_group_end(chord.tasks, **header)
+
+    def on_chord_body(self, chord, **header) -> dict:
+        """Method that is called on chord body stamping.
+
+         Arguments:
+             chord (chord): chord that is stamped.
+             headers (Dict): Partial headers that could be merged with existing headers.
+         Returns:
+             Dict: headers to update.
+        """
+        return {}
+
+
+class GroupStampingVisitor(StampingVisitor):
+    """
+    Group stamping implementation based on Stamping API.
+    """
+
+    def __init__(self, groups=None, stamped_headers=None):
+        self.groups = groups or []
+        self.stamped_headers = stamped_headers or []
+        if "groups" not in self.stamped_headers:
+            self.stamped_headers.append("groups")
+
+    def on_group_start(self, group, **headers) -> dict:
+        if group.id is None:
+            group.set(task_id=uuid())
+
+        if group.id not in self.groups:
+            self.groups.append(group.id)
+        return super().on_group_start(group, **headers)
+
+    def on_group_end(self, group, **headers) -> None:
+        self.groups.pop()
+
+    def on_signature(self, sig, **headers) -> dict:
+        return {'groups': list(self.groups), "stamped_headers": list(self.stamped_headers)}
 
 
 @abstract.CallableSignature.register
@@ -118,7 +265,7 @@ class Signature(dict):
     _app = _type = None
     # The following fields must not be changed during freezing/merging because
     # to do so would disrupt completion of parent tasks
-    _IMMUTABLE_OPTIONS = {"group_id"}
+    _IMMUTABLE_OPTIONS = {"group_id", "stamped_headers"}
 
     @classmethod
     def register_type(cls, name=None):
@@ -178,6 +325,9 @@ class Signature(dict):
         """
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
         # Extra options set to None are dismissed
         options = {k: v for k, v in options.items() if v is not None}
         # For callbacks: extra args are prepended to the stored args.
@@ -201,6 +351,9 @@ class Signature(dict):
         """
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
         # Extra options set to None are dismissed
         options = {k: v for k, v in options.items() if v is not None}
         try:
@@ -225,10 +378,13 @@ class Signature(dict):
             # override values in `self.options` except for keys which are
             # noted as being immutable (unrelated to signature immutability)
             # implying that allowing their value to change would stall tasks
-            new_options = dict(self.options, **{
+            immutable_options = self._IMMUTABLE_OPTIONS
+            if "stamped_headers" in self.options:
+                immutable_options = self._IMMUTABLE_OPTIONS.union(set(self.options["stamped_headers"]))
+            new_options = {**self.options, **{
                 k: v for k, v in options.items()
-                if k not in self._IMMUTABLE_OPTIONS or k not in self.options
-            })
+                if k not in immutable_options or k not in self.options
+            }}
         else:
             new_options = self.options
         if self.immutable and not force:
@@ -334,6 +490,23 @@ class Signature(dict):
     def set_immutable(self, immutable):
         self.immutable = immutable
 
+    def stamp(self, visitor=None, **headers):
+        """Stamp this signature with additional custom headers.
+        Using a visitor will pass on responsibility for the stamping
+        to the visitor.
+
+        Arguments:
+            visitor (StampingVisitor): Visitor API object.
+            headers (Dict): Stamps that should be added to headers.
+        """
+        headers = headers.copy()
+        if visitor is not None:
+            headers.update(visitor.on_signature(self, **headers))
+        else:
+            headers["stamped_headers"] = [header for header in headers.keys() if header not in self.options]
+            _merge_dictionaries(headers, self.options)
+        return self.set(**headers)
+
     def _with_list_option(self, key):
         items = self.options.setdefault(key, [])
         if not isinstance(items, MutableSequence):
@@ -431,7 +604,7 @@ class Signature(dict):
 
     def __deepcopy__(self, memo):
         memo[id(self)] = self
-        return dict(self)
+        return dict(self)  # TODO: Potential bug of being a shallow copy
 
     def __invert__(self):
         return self.apply_async().get()
@@ -558,7 +731,7 @@ class _chain(Signature):
             if isinstance(tasks, tuple):  # aaaargh
                 tasks = d['kwargs']['tasks'] = list(tasks)
             tasks = [maybe_signature(task, app=app) for task in tasks]
-        return _chain(tasks, app=app, **d['options'])
+        return cls(tasks, app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         tasks = (regen(tasks[0]) if len(tasks) == 1 and is_list(tasks[0])
@@ -582,11 +755,13 @@ class _chain(Signature):
             if not tasks:
                 # If the chain is empty, return the group
                 return other
-            return _chain(seq_concat_item(
+            # use type(self) for _chain subclasses
+            return type(self)(seq_concat_item(
                 tasks, other), app=self._app)
         elif isinstance(other, _chain):
             # chain | chain -> chain
-            return _chain(seq_concat_seq(
+            # use type(self) for _chain subclasses
+            return type(self)(seq_concat_seq(
                 self.unchain_tasks(), other.unchain_tasks()), app=self._app)
         elif isinstance(other, Signature):
             if self.tasks and isinstance(self.tasks[-1], group):
@@ -602,7 +777,8 @@ class _chain(Signature):
                 return sig
             else:
                 # chain | task -> chain
-                return _chain(seq_concat_item(
+                # use type(self) for _chain subclasses
+                return type(self)(seq_concat_item(
                     self.unchain_tasks(), other), app=self._app)
         else:
             return NotImplemented
@@ -630,6 +806,7 @@ class _chain(Signature):
         args = args if args else ()
         kwargs = kwargs if kwargs else []
         app = self.app
+
         if app.conf.task_always_eager:
             with allow_join_result():
                 return self.apply(args, kwargs, **options)
@@ -655,6 +832,10 @@ class _chain(Signature):
             args, kwargs, self.tasks, root_id, parent_id, link_error, app,
             task_id, group_id, chord, group_index=group_index,
         )
+
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
 
         if results_from_prepare:
             if link:
@@ -685,6 +866,17 @@ class _chain(Signature):
             group_index=group_index,
         )
         return results[0]
+
+    def stamp(self, visitor=None, **headers):
+        if visitor is not None:
+            headers.update(visitor.on_chain_start(self, **headers))
+
+        super().stamp(visitor=visitor, **headers)
+        for task in self.tasks:
+            task.stamp(visitor=visitor, **headers)
+
+        if visitor is not None:
+            visitor.on_chain_end(self, **headers)
 
     def prepare_steps(self, args, kwargs, tasks,
                       root_id=None, parent_id=None, link_error=None, app=None,
@@ -725,7 +917,7 @@ class _chain(Signature):
                 task = from_dict(task, app=app)
             if isinstance(task, group):
                 # when groups are nested, they are unrolled - all tasks within
-                # groups within groups should be called in parallel
+                # groups should be called in parallel
                 task = maybe_unroll_group(task)
 
             # first task gets partial args from chain
@@ -813,6 +1005,9 @@ class _chain(Signature):
     def apply(self, args=None, kwargs=None, **options):
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
         last, (fargs, fkwargs) = None, (args, kwargs)
         for task in self.tasks:
             res = task.clone(fargs, fkwargs).apply(
@@ -894,7 +1089,10 @@ class chain(_chain):
                 tasks = tasks[0] if len(tasks) == 1 else tasks
                 # if is_list(tasks) and len(tasks) == 1:
                 #     return super(chain, cls).__new__(cls, tasks, **kwargs)
-                return reduce(operator.or_, tasks, chain())
+                new_instance = reduce(operator.or_, tasks, _chain())
+                if cls != chain and isinstance(new_instance, _chain) and not isinstance(new_instance, cls):
+                    return super().__new__(cls, new_instance.tasks, **kwargs)
+                return new_instance
         return super().__new__(cls, *tasks, **kwargs)
 
 
@@ -957,7 +1155,7 @@ class chunks(Signature):
 
     @classmethod
     def from_dict(cls, d, app=None):
-        return chunks(*cls._unpack_args(d['kwargs']), app=app, **d['options'])
+        return cls(*cls._unpack_args(d['kwargs']), app=app, **d['options'])
 
     def __init__(self, task, it, n, **options):
         super().__init__('celery.chunks', (),
@@ -1047,7 +1245,7 @@ class group(Signature):
         d["kwargs"]["tasks"] = rebuilt_tasks = type(orig_tasks)(
             maybe_signature(task, app=app) for task in orig_tasks
         )
-        return group(rebuilt_tasks, app=app, **d['options'])
+        return cls(rebuilt_tasks, app=app, **d['options'])
 
     def __init__(self, *tasks, **options):
         if len(tasks) == 1:
@@ -1091,6 +1289,11 @@ class group(Signature):
 
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
+
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+
         p = barrier()
         results = list(self._apply_tasks(tasks, producer, app, p,
                                          args=args, kwargs=kwargs, **options))
@@ -1114,6 +1317,9 @@ class group(Signature):
     def apply(self, args=None, kwargs=None, **options):
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
         app = self.app
         if not self.tasks:
             return self.freeze()  # empty group returns GroupResult
@@ -1126,6 +1332,28 @@ class group(Signature):
     def set_immutable(self, immutable):
         for task in self.tasks:
             task.set_immutable(immutable)
+
+    def stamp(self, visitor=None, **headers):
+        if visitor is not None:
+            headers.update(visitor.on_group_start(self, **headers))
+
+        super().stamp(visitor=visitor, **headers)
+
+        if isinstance(self.tasks, _regen):
+            self.tasks.map(_partial(_stamp_regen_task, visitor=visitor, **headers))
+        else:
+            new_tasks = []
+            for task in self.tasks:
+                task = maybe_signature(task, app=self.app)
+                task.stamp(visitor=visitor, **headers)
+                new_tasks.append(task)
+            if isinstance(self.tasks, MutableSequence):
+                self.tasks[:] = new_tasks
+            else:
+                self.tasks = new_tasks
+
+        if visitor is not None:
+            visitor.on_group_end(self, **headers)
 
     def link(self, sig):
         # Simply link to first task. Doing this is slightly misleading because
@@ -1183,9 +1411,11 @@ class group(Signature):
             # next_task is None.  This enables us to set the chord size
             # without burning through the entire generator.  See #3021.
             chord_size = 0
-            for task_index, (current_task, next_task) in enumerate(
-                lookahead(tasks)
-            ):
+            tasks_shifted, tasks = itertools.tee(tasks)
+            next(tasks_shifted, None)
+            next_task = next(tasks_shifted, None)
+
+            for task_index, current_task in enumerate(tasks):
                 # We expect that each task must be part of the same group which
                 # seems sensible enough. If that's somehow not the case we'll
                 # end up messing up chord counts and there are all sorts of
@@ -1211,12 +1441,16 @@ class group(Signature):
                 if p and not p.cancelled and not p.ready:
                     p.size += 1
                     res.then(p, weak=True)
+                next_task = next(tasks_shifted, None)
                 yield res  # <-- r.parent, etc set in the frozen result.
 
     def _freeze_gid(self, options):
         # remove task_id and use that as the group_id,
         # if we don't remove it then every task will have the same id...
-        options = dict(self.options, **options)
+        options = {**self.options, **{
+            k: v for k, v in options.items()
+            if k not in self._IMMUTABLE_OPTIONS or k not in self.options
+        }}
         options['group_id'] = group_id = (
             options.pop('task_id', uuid()))
         return options, group_id, options.get('root_id')
@@ -1248,7 +1482,7 @@ class group(Signature):
             # we freeze all tasks in the clone tasks1, and then zip the results
             # with the IDs of tasks in the second clone, tasks2. and then, we build
             # a generator that takes only the task IDs from tasks2.
-            self.tasks = regen(x[0] for x in zip(tasks2, results))
+            self.tasks = regen(tasks2)
         else:
             new_tasks = []
             # Need to unroll subgroups early so that chord gets the
@@ -1377,7 +1611,7 @@ class _chord(Signature):
 
     def __or__(self, other):
         if (not isinstance(other, (group, _chain)) and
-           isinstance(other, Signature)):
+                isinstance(other, Signature)):
             # chord | task ->  attach to body
             sig = self.clone()
             sig.body = sig.body | other
@@ -1394,25 +1628,51 @@ class _chord(Signature):
         # first freeze all tasks in the header
         header_result = self.tasks.freeze(
             parent_id=parent_id, root_id=root_id, chord=self.body)
-        # secondly freeze all tasks in the body: those that should be called after the header
-        body_result = self.body.freeze(
-            _id, root_id=root_id, chord=chord, group_id=group_id,
-            group_index=group_index)
-        # we need to link the body result back to the group result,
-        # but the body may actually be a chain,
-        # so find the first result without a parent
-        node = body_result
-        seen = set()
-        while node:
-            if node.id in seen:
-                raise RuntimeError('Recursive result parents')
-            seen.add(node.id)
-            if node.parent is None:
-                node.parent = header_result
-                break
-            node = node.parent
         self.id = self.tasks.id
+        # secondly freeze all tasks in the body: those that should be called after the header
+
+        body_result = None
+        if self.body:
+            body_result = self.body.freeze(
+                _id, root_id=root_id, chord=chord, group_id=group_id,
+                group_index=group_index)
+            # we need to link the body result back to the group result,
+            # but the body may actually be a chain,
+            # so find the first result without a parent
+            node = body_result
+            seen = set()
+            while node:
+                if node.id in seen:
+                    raise RuntimeError('Recursive result parents')
+                seen.add(node.id)
+                if node.parent is None:
+                    node.parent = header_result
+                    break
+                node = node.parent
+
         return body_result
+
+    def stamp(self, visitor=None, **headers):
+        if visitor is not None:
+            headers.update(visitor.on_chord_header_start(self, **headers))
+        super().stamp(visitor=visitor, **headers)
+
+        tasks = self.tasks
+        if isinstance(tasks, group):
+            tasks = tasks.tasks
+
+        if isinstance(tasks, _regen):
+            tasks.map(_partial(_stamp_regen_task, visitor=visitor, **headers))
+        else:
+            for task in tasks:
+                task.stamp(visitor=visitor, **headers)
+
+        if visitor is not None:
+            visitor.on_chord_header_end(self, **headers)
+
+        if visitor is not None and self.body is not None:
+            headers.update(visitor.on_chord_body(self, **headers))
+            self.body.stamp(visitor=visitor, **headers)
 
     def apply_async(self, args=None, kwargs=None, task_id=None,
                     producer=None, publisher=None, connection=None,
@@ -1426,27 +1686,37 @@ class _chord(Signature):
         body = body.clone(**options)
         app = self._get_app(body)
         tasks = (self.tasks.clone() if isinstance(self.tasks, group)
-                 else group(self.tasks, app=app))
+                 else group(self.tasks, app=app, task_id=self.options.get('task_id', uuid())))
         if app.conf.task_always_eager:
             with allow_join_result():
                 return self.apply(args, kwargs,
                                   body=body, task_id=task_id, **options)
 
+        groups = self.options.get("groups")
+        stamped_headers = self.options.get("stamped_headers")
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+        tasks.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+
         merged_options = dict(self.options, **options) if options else self.options
+
         option_task_id = merged_options.pop("task_id", None)
         if task_id is None:
             task_id = option_task_id
 
         # chord([A, B, ...], C)
-        return self.run(tasks, body, args, task_id=task_id, **merged_options)
+        return self.run(tasks, body, args, task_id=task_id, kwargs=kwargs, **merged_options)
 
     def apply(self, args=None, kwargs=None,
               propagate=True, body=None, **options):
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+        stamped_headers = self.options.get("stamped_headers")
+        groups = self.options.get("groups")
         body = self.body if body is None else body
         tasks = (self.tasks.clone() if isinstance(self.tasks, group)
                  else group(self.tasks, app=self.app))
+        self.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
+        tasks.stamp(visitor=GroupStampingVisitor(groups=groups, stamped_headers=stamped_headers))
         return body.apply(
             args=(tasks.apply(args, kwargs).get(propagate=propagate),),
         )
@@ -1466,10 +1736,9 @@ class _chord(Signature):
                 child_size = cls._descend(child_sig)
                 if child_size > 0:
                     return child_size
-            else:
-                # We have to just hope this chain is part of some encapsulating
-                # signature which is valid and can fire the chord body
-                return 0
+            # We have to just hope this chain is part of some encapsulating
+            # signature which is valid and can fire the chord body
+            return 0
         elif isinstance(sig_obj, chord):
             # The child chord's body counts toward this chord
             return cls._descend(sig_obj.body)
@@ -1485,7 +1754,7 @@ class _chord(Signature):
 
     def run(self, header, body, partial_args, app=None, interval=None,
             countdown=1, max_retries=None, eager=False,
-            task_id=None, **options):
+            task_id=None, kwargs=None, **options):
         app = app or self._get_app(body)
         group_id = header.options.get('task_id') or uuid()
         root_id = body.options.get('root_id')
@@ -1512,7 +1781,7 @@ class _chord(Signature):
                 countdown=countdown,
                 max_retries=max_retries,
             )
-            header_result = header(*partial_args, task_id=group_id, **options)
+            header_result = header.apply_async(partial_args, kwargs, task_id=group_id, **options)
         # The execution of a chord body is normally triggered by its header's
         # tasks completing. If the header is empty this will never happen, so
         # we execute the body manually here.
@@ -1538,6 +1807,23 @@ class _chord(Signature):
         return callback
 
     def link_error(self, errback):
+        if self.app.conf.task_allow_error_cb_on_chord_header:
+            # self.tasks can be a list of the chord header workflow.
+            if isinstance(self.tasks, list):
+                for task in self.tasks:
+                    task.link_error(errback)
+            else:
+                self.tasks.link_error(errback)
+        else:
+            warnings.warn(
+                "task_allow_error_cb_on_chord_header=False is pending deprecation in "
+                "a future release of Celery.\n"
+                "Please test the new behavior by setting task_allow_error_cb_on_chord_header to True "
+                "and report any concerns you might have in our issue tracker before we make a final decision "
+                "regarding how errbacks should behave when used with chords.",
+                CPendingDeprecationWarning
+            )
+
         self.body.link_error(errback)
         return errback
 

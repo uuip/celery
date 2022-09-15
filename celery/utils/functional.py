@@ -200,6 +200,10 @@ class _regen(UserList, list):
     def __reduce__(self):
         return list, (self.data,)
 
+    def map(self, func):
+        self.__consumed = [func(el) for el in self.__consumed]
+        self.__it = map(func, self.__it)
+
     def __length_hint__(self):
         return self.__it.__length_hint__()
 
@@ -311,7 +315,7 @@ def head_from_fun(fun, bound=False, debug=False):
     # with an empty body, meaning it has the same performance as
     # as just calling a function.
     is_function = inspect.isfunction(fun)
-    is_callable = hasattr(fun, '__call__')
+    is_callable = callable(fun)
     is_cython = fun.__class__.__name__ == 'cython_function_or_method'
     is_method = inspect.ismethod(fun)
 
