@@ -18,7 +18,7 @@ SIG = Signature({
     'subtask_type': ''},
 )
 try:
-    from collections import Iterable
+    from collections.abc import Iterable
 except ImportError:
     from collections.abc import Iterable
 
@@ -2120,6 +2120,21 @@ class test_chord(CanvasCase):
                 child_sig.link_error.assert_called_once_with(errback_sig)
             # body
             body.link_error.assert_has_calls([call(errback_sig), call(errback_sig)])
+
+    @pytest.mark.usefixtures('depends_on_current_app')
+    def test_flag_allow_error_cb_on_chord_header_various_header_types(self):
+        """ Test chord link_error with various header types. """
+        self.app.conf.task_allow_error_cb_on_chord_header = True
+        headers = [
+            signature('t'),
+            [signature('t'), signature('t')],
+            group(signature('t'), signature('t'))
+        ]
+        for chord_header in headers:
+            c = chord(chord_header, signature('t'))
+            sig = signature('t')
+            errback = c.link_error(sig)
+            assert errback == sig
 
 
 class test_maybe_signature(CanvasCase):
